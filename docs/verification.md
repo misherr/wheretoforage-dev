@@ -639,3 +639,107 @@ nothing rideable at the pavement is told the walk *and why*. The regex-only vers
 passed unchanged when the rider branch was disabled with `const ridden=false&&…`; the runnable one
 fails on the first assertion. That is the same gap as a log line reporting 9,106 blocked ways that
 blocked nothing — see [Assert on the effect, not on the log](#assert-on-the-effect-not-on-the-log).
+
+## A test that agrees with you by construction
+
+The 30 m habitat fetch had one thing to get right before it could be trusted: whether an
+`exportImage` request returns LANDFIRE's own 30 m pixels or a resampling of them. ROADMAP.md named
+the test to write — snap the request to the grid, check the pixel size is 30.000 m, and compare pixel
+centres against the `identify` point service. It scored 8 of 8, then 24 of 24 on deliberately
+heterogeneous ground where 83% of neighbouring pixels differ.
+
+**It proves nothing about alignment.** Nearest-neighbour resampling gives an output pixel the value of
+the native pixel containing its centre. `identify` returns the value of the native pixel containing
+the point you ask about. Ask about a pixel's own centre and the two are looking up the same native
+pixel by the same rule — they agree whatever the grid is doing. The pixel size is no better: it is
+computed from the extent and size of the request, so a half-pixel-shifted request reports 30.000 m as
+happily as an aligned one.
+
+Both checks were re-run against a deliberately misaligned request. Both passed.
+
+**What does work is oversampling.** Ask for 3 m pixels over a strip — ten samples across each native
+pixel — and the positions where values change are the native pixel edges, measured rather than
+declared. Then look at the phase of those positions:
+
+| | aligned | half a pixel out |
+| --- | --- | --- |
+| boundaries found | 615 | 615 |
+| at phase 15 mod 30 | **615** | 0 |
+| runs a whole number of native pixels | yes | no |
+
+That test distinguishes the two cases absolutely, and it is what `phaseOfBoundaries()` does — in
+`habitat-grid.mjs`, so the fetch's live preflight and the offline tests run the same code. The fetch
+**aborts** if the probe fails, because a gigabyte pulled on a moved grid looks exactly like a good one.
+
+Three things fell out of doing it properly, each of which the plan had wrong:
+
+- **The grid is at phase 15, not 0.** LANDFIRE's extent corner is x −2,362,425, y 3,267,405, both
+  15 mod 30: native pixel edges at 15 mod 30, native centres at multiples of 30. Snapping to multiples
+  of 30 — the obvious rule — is exactly half a pixel out.
+- **The service honours whatever phase you ask for.** Requests at phase 15, 0 and 7 all came back at
+  precisely the bbox asked for. It does not snap to its own grid, so alignment is entirely the
+  client's problem.
+- **Misalignment displaces rather than corrupts.** A window moved −15 m matched the aligned read at
+  the same index on **100.0%** of pixels; one moved +15 m matched it one pixel across, also **100.0%**.
+  The tie at each native edge resolves deterministically, so the raster comes back shifted by one
+  index. Every value is real; the geolocation is up to 15 m out. Worth fixing, not worth dramatising —
+  and a different claim from the one the plan made.
+
+## Plausible-looking garbage from a TIFF read one tile at a time
+
+The service returns its rasters as **tiled** TIFFs, 128 × 128 blocks. The first reader took
+`tileOffsets`, used the first entry, and then indexed as though the rows were contiguous.
+
+Everything past column 128 was garbage — and it did not look like garbage. It looked like data with
+realistic local variation, because it *was* data, from the wrong part of the image. It only surfaced
+because the phase measurement came back nonsense: value boundaries at every phase and 225 changes per
+row of a 100-native-pixel row, when a 30 m source cannot produce more than 99. **The absurd count was
+the tell, not the values.**
+
+The reader now walks every `tileOffsets` entry, checks the count against `ceil(w/tw) × ceil(h/tl)`,
+and refuses a file whose pixels would run past the end of the buffer. Its test fixture is **multi-tile
+on purpose** — a single-tile fixture passes against the broken reader.
+
+## The datum is not the projection
+
+`project()` in `habitat-grid.mjs` is a hand-written Albers equal-area conic, so it needed checking
+against something. Compared with the service's own conversion over five points across the state, it
+sat **0.90 m away in x and −0.90 m in y — constant to within 4 cm**.
+
+A constant offset is not a projection error. It is the datum: EPSG:5070 is NAD83, the app's
+coordinates are WGS84, and in the Pacific Northwest those differ by about **1.28 m**. A wrong
+ellipsoid constant or standard parallel would have produced a *varying* discrepancy, which is what the
+preflight actually tests for — it aborts on a spread over half a metre and lets a constant offset
+through.
+
+Two consequences worth having written down:
+
+- **A cross-check must ask in 5070**, with an already-projected coordinate, or the datum folds into
+  the comparison: 1.28 m against a 30 m pixel puts roughly 12% of sample points on the wrong side of a
+  pixel boundary, which reads as a bug in the pipeline.
+- **A later emission step has to decide about the 1.28 m**, which is 4% of a pixel — nothing for a
+  summary over 2,886 pixels, not nothing for per-pixel tiles registered against imagery. It is
+  recorded in the checkpoint manifest rather than left to be rediscovered.
+
+## Node's own HTTP client killed two runs
+
+At tile 375 of 591, and again during a preflight:
+
+```
+AssertionError: The expression evaluated to a falsy value: assert(!this.paused)
+    at Parser.finish (node:internal/deps/undici/undici)
+    at TLSSocket.onHttpSocketEnd
+```
+
+That is undici tearing down a keep-alive socket the server closed mid-response. It is thrown from an
+internal event handler, so **no `try/catch` around `fetch()` can see it** and the process dies.
+Setting `connection: close` does nothing — fetch forbids that header — and `setGlobalDispatcher`
+needs the `undici` package, which this repo has no dependencies to spend.
+
+The fix is `node:https` with `new https.Agent({ keepAlive: false })`: an agent is a thing you can
+turn off, and a handshake per request costs about a minute across the state. The crash has not
+recurred.
+
+**The checkpoint is what made both deaths cheap** — the manifest is written after every tile, so the
+first cost one tile out of 375 and a `--resume`. Worth remembering next time a long fetch is
+tempting to write without one.

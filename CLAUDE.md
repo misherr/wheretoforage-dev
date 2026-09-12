@@ -20,7 +20,8 @@ src/grid.mjs    the cell lattice, the state outline, terrainAt, pointKey
 src/access.mjs  how you would reach a cell — a separate axis, never a score input
 src/coords.mjs  the coordinate readout and the paste parser
 scripts/        build-cells.mjs, build-access.mjs, fetch-weather.mjs, serve.mjs,
-                access-network.mjs (the network, the drive and the bike), access-modes.mjs (per-cell figures)
+                access-network.mjs (the network, the drive and the bike), access-modes.mjs (per-cell figures),
+                fetch-habitat.mjs + habitat-grid.mjs (the 30 m raster fetch — no emission yet)
 tests/model/    the model regression suite
 data/           cells.json, weather.json, evt-names.json, access.json (+ -hike/-drive/-bike/-moto,
                 -geom, access-routes/) — checked in
@@ -334,6 +335,15 @@ waiter process parked on a job that has already finished.
 have now been degraded by Overpass one way or another. The fix is a local
 Geofabrik extract; see [ROADMAP.md](ROADMAP.md).
 
+**The 30 m habitat checkpoint is a fetch, not a rebuild.** `data/habitat-30m.checkpoint/` (323 MB,
+gitignored) holds LANDFIRE's EVT, EVC and EVH at native 30 m over Washington — 591 gzipped Int16
+tiles and a manifest. **Nothing reads it yet and nothing may**: the per-cell-summary versus
+per-pixel-tiles decision waits on the October band reading, and until then no score moves and
+`cells.json` does not change. `node scripts/fetch-habitat.mjs --resume` tops it up; a satisfied
+resume costs four seconds. The grid's phase is the trap — native pixel edges are at 15 mod 30 in
+EPSG:5070, not multiples of 30 — and `habitat-grid.mjs` is the only place that knows it.
+[ROADMAP.md](ROADMAP.md), [docs/verification.md](docs/verification.md#a-test-that-agrees-with-you-by-construction)
+
 **The access checkpoint is kept on success and re-assembling from it is free.**
 Everything after the fetch — the category rules, trailhead inference, which way
 each cell is nearest, route joining, elevation, the row format — is assembly.
@@ -355,6 +365,9 @@ grids and one forecast-only. [docs/weather-archive.md](docs/weather-archive.md)
   more. Do not reconstruct codes from legend order.
   [docs/landfire-vegetation.md](docs/landfire-vegetation.md)
 - **The repository guards** in `.github/workflows/`.
+- **`data/habitat-30m.checkpoint/`** — 323 MB of fetched 30 m raster, gitignored and kept on
+  purpose. Re-fetching it is 20 minutes and 1.23 GB; deleting it to tidy up is the mistake the access
+  checkpoint's history already records.
 - **`pointKey`'s five decimals** and the `axisFor()` start/end asymmetry. Both
   look like inconsistencies and are load-bearing.
 - **Open-Meteo's `models=` parameter.** Pinning `ecmwf_ifs025` would populate the

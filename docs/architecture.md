@@ -134,6 +134,13 @@ every file, what it does, and the reasoning that is not obvious from reading it.
   hike and the drive do not need and do not pay for. `access-moto.json` also carries
   `excluded`, the trail mileage its designation rule leaves out, so the sheet can
   say so from the data rather than from a constant.
+- **`data/habitat-30m.checkpoint/`** — LANDFIRE EVT, EVC and EVH at native
+  30 m over Washington: 591 gzipped row-major `Int16LE` tiles of 1,024² pixels
+  plus a manifest, 323 MB, **gitignored and not read by anything yet**. The fetch
+  stage of the 30 m habitat rebuild, done ahead of the decision about what to emit
+  from it so that the expensive part is not on the critical path twice. Written by
+  `scripts/fetch-habitat.mjs`; the grid, the EPSG:5070 projection and the TIFF
+  reader are in `scripts/habitat-grid.mjs`, pure and tested offline.
 - **`data/access-routes/`** — the route each cell's figure walks, in **264 regional
   files** of 16 cells square, one fetched when "Show the route" is tapped and each
   stamped with the bake. Per shard: a table of way stretches and, per cell, a list

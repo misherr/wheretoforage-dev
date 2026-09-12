@@ -543,40 +543,157 @@ which parts are hard.
 back as a 33,986-byte tiled, uncompressed, 16-bit signed TIFF. A minimal tag reader is enough to get
 at the pixels — no GeoTIFF library needed for thematic single-band data.
 
-#### The EPSG:5070 snapping trap, and how it was caught
+#### The EPSG:5070 snapping trap — corrected 2026-09-12, when the test was actually written
 
-**A request must be snapped to the native 30 m grid in 5070, or the service resamples and the "30 m"
-in the name is a claim the data does not support.**
+**The first version of this section was wrong in three ways, and writing the test it asked for is
+what found them.** It is left here corrected rather than quietly rewritten, because the wrong version
+was convincing and the right one is not obvious.
 
-The first test asked for 100 × 100 pixels over a bbox in degrees (0.05° × 0.02°, about 3.7 × 2.2 km).
-It came back happily — at **37 × 22 m pixels**, a resampling — and its centre pixel read EVC 177
-where the `identify` service said 175 at the same coordinate. Two cover points, from a test that
-looked like it had passed.
+**1. The native grid is at phase 15, not 0.** Snapping to multiples of 30 — the obvious rule, and the
+one this entry carried — is half a pixel out. The service's own extent corner is x −2,362,425,
+y 3,267,405, and **both are 15 mod 30**: native pixel EDGES sit at 15 mod 30 and native pixel CENTRES
+at multiples of 30. Measured rather than taken from the declaration, by oversampling a strip at 3 m
+and asking where the values change, which is where the native edges are: over two areas, **615 of 615
+boundaries sat at phase 15 and none at phase 0**, with every run between them an exact multiple of ten
+3 m samples. `habitat-grid.mjs` holds this in one place, `PHASE`, and refuses a request built any
+other way.
 
-The second test snapped the bbox to multiples of 30 m in 5070 and asked for the matching pixel count:
-extent came back as exactly **30.000 × 30.000 m** pixels, and **all 8 pixel centres sampled agreed
-with `identify`** at the same point (asked in 5070, so no projection arithmetic of ours was involved
-in the check). That is the test to write first when this is built, and it is the test that says
-whether the pipeline reads LANDFIRE pixels or a picture of them.
+**2. The checks the old section named prove nothing about alignment.** Neither "the extent came back
+at exactly 30.000 m pixels" nor "every pixel centre agreed with `identify`" distinguishes a native
+read from a misaligned one:
 
-Statewide cost: the bake's own `STATE` bbox is 390 × 605 km, so 13,000 × 20,167 pixels =
-**262 million per layer, 785 million for three** — more than the 138.6 M the cells actually occupy,
-because a bounding box over Washington is mostly not Washington. At 4,096² that is **16 exports per
-layer, 48 for three**, and **1.57 GB** as the uncompressed `S16` the service returned
-(`compression: 1`). PNG or LERC would shrink thematic data hard, and clipping requests to the cell
-footprint would cut the pixel count by nearly half again; both are worth measuring rather than
-assuming, and neither changes the shape of the plan.
+- a half-pixel-shifted request still reports 30.000 m pixels, because the request's own size and
+  extent are what that number is computed from;
+- `identify` agrees **by construction**. Nearest-neighbour gives an output pixel the value of the
+  native pixel containing its centre, and `identify` returns the value of the native pixel containing
+  the same point. They cannot disagree, whatever the alignment. The old section's 8/8 was re-run on
+  deliberately heterogeneous ground, where 83% of neighbouring pixels differ, and scored 24/24 while
+  still proving nothing.
 
-#### Step one, which serves either outcome: fetch to a checkpoint
+  `identify` keeps its place in the verification, but for what it does test: the projection, the
+  window bookkeeping, the tile indexing and the decode. That is a different claim, and it is the one
+  the fetch's cross-check makes.
 
-**The expensive step is shared.** Pulling the raster down is the same work whether the result becomes
-one summary per cell or a pyramid of tiles, so it should land in a **checkpoint** first and the
-emission decision should be taken afterwards, against real data rather than against this entry.
+**3. Misalignment displaces, it does not corrupt.** The old section implied a misaligned read would
+not be LANDFIRE data. It is: every value is a real LANDFIRE value, attributed to a 30 m cell whose
+bounds are up to 15 m off. A window moved −15 m matched the aligned read **at the same index, 100.0%**
+of pixels, and one moved +15 m matched it **one pixel across, also 100.0%** — the tie at each native
+edge resolves deterministically, so the result is the raster shifted by one index, not scrambled. The
+cost is a half-pixel geolocation error: negligible for a summary over 2,886 pixels, not nothing for
+per-pixel tiles, and worth getting right without dramatising.
 
-`build-access.mjs` already carries the lesson: *"The access checkpoint is kept on success and
+**What the real trap is.** Asking in degrees, or with a pixel count that does not match the extent,
+makes the service resample to whatever pixel size the numbers imply — 41.7 m in one observation,
+37 × 22 m in another. *That* destroys the one-to-one correspondence with native pixels, and it is
+caught by checking the returned extent and size against the request, which `exportWindow()` does on
+every tile.
+
+**Two more things the fetch had to learn, neither of them in the old plan:**
+
+- **The service honours whatever phase you ask for.** It does not snap to its own grid: requests at
+  phase 15, 0 and 7 all came back at exactly the bbox asked for. Alignment is entirely the client's
+  problem, which is why `alignedWindow()` is the only way that code builds a bbox and `isAligned()`
+  is asserted again at the request.
+- **The returned TIFF is TILED**, in 128 × 128 blocks. A reader that takes the first tile's offset and
+  then indexes as though rows were contiguous returns garbage past column 128 — and plausible-looking
+  garbage, with realistic variation. That bug is why the first phase measurement showed boundaries at
+  every phase instead of one. The test fixture is deliberately multi-tile.
+
+Statewide cost, now measured rather than estimated. The window the cells occupy is **19,713 × 14,517
+pixels, 286.2 M per layer**; the estimate in the first version of this entry was 262 M, from a bbox in
+degrees rather than the projected cell corners. Only tiles holding cells are fetched, and the tile
+size decides how much of the window that saves:
+
+| tile | km | tiles held / in window | pixels per layer | three layers | requests |
+| --- | --- | --- | --- | --- | --- |
+| 4096 | 123 | 20 / 20 | 286 M | 1.72 GB | 60 |
+| 2048 | 61 | 59 / 80 | 237 M | 1.42 GB | 177 |
+| **1024** | **31** | **197 / 300** | **204 M** | **1.22 GB** | **591** |
+| 512 | 15 | 683 / 1131 | 178 M | 1.07 GB | 2049 |
+| 256 | 8 | 2512 / 4446 | 165 M | 0.99 GB | 7536 |
+
+**1,024 was chosen**: 591 requests is the same order as the 579 this service already answers for every
+`cells.json` bake, a rate it is known to tolerate, and it takes 29% off the volume. 512 more than
+triples the requests for another 12%. A 1,024-square tile is also 2 MB decoded rather than 33, so a
+retry is cheap and a resume is fine-grained.
+
+#### Step one — DONE 2026-09-12: the raster is in a checkpoint
+
+**The expensive step is shared**, so it was done first and the emission decision waits. Pulling the
+raster down is the same work whether the result becomes one summary per cell or a pyramid of tiles.
+`build-access.mjs` carries the lesson this follows: *"The access checkpoint is kept on success and
 re-assembling from it is free... Deleting it once turned an assembly change into a ten-hour
-re-fetch."* A habitat checkpoint of raw 30 m pixels is the same bargain at a similar scale, and every
-question below then costs minutes instead of gigabytes.
+re-fetch."*
+
+```bash
+node scripts/fetch-habitat.mjs --probe-only      # the preflight, no download
+node scripts/fetch-habitat.mjs --dry-run         # the plan and its volume
+node scripts/fetch-habitat.mjs > habitat.log 2>&1
+node scripts/fetch-habitat.mjs --resume          # after any interruption
+```
+
+`scripts/habitat-grid.mjs` holds the grid, the projection and the TIFF reader, all pure and tested
+offline; `scripts/fetch-habitat.mjs` does the fetching and owns the checkpoint. **Neither emits
+anything**, there is no `--emit` flag to find, and a test asserts the run leaves every file outside
+its own directory byte-identical — `data/cells.json` included, because the sequencing decision below
+depends on no score moving.
+
+**What is on disk** — `data/habitat-30m.checkpoint/`, gitignored, **323 MB**:
+
+```
+manifest.json                  0.19 MB — the grid, per-tile records, preflight and verification results
+evt/<row>_<col>.bin.gz          61 MB over 197 tiles (14.8% of raw)
+evc/<row>_<col>.bin.gz         150 MB over 197 tiles (36.7%)
+evh/<row>_<col>.bin.gz         112 MB over 197 tiles (27.5%)
+```
+
+Each tile is its window's pixels as **row-major `Int16LE`, gzipped** — decoded at fetch time rather
+than stored as the TIFF, so a short download fails here instead of six weeks from now and an emission
+step needs no TIFF reader. The grid is **19,713 × 14,517 pixels of 30 m** in EPSG:5070, phase 15,
+bbox `-2137335, 2736435, -1545945, 3171945`, cut into 1,024² tiles of which **197 of 300 hold
+cells** — 204.1 M pixels a layer, 612.4 M in all.
+
+**Against the estimate in this entry: 1.22 GB raw against 1.57 GB predicted**, 22% under, because
+fetching only the tiles that hold cells took 29% off a full-window read. On disk it is **323 MB**,
+26.3% of raw, which the estimate did not cover at all. **1.23 GB downloaded** and **20 minutes of
+tile fetching**; about 50 minutes of wall clock across two attempts, the first killed at tile 375 by a
+crash in Node's own HTTP client (see
+[verification.md](docs/verification.md#nodes-own-http-client-killed-two-runs)) and resumed for the
+cost of one tile.
+
+**Checked, and the checks are in the manifest:**
+
+- the preflight **aborts** unless the service still reports 30 m / S16 / phase 15, an oversampled
+  strip still puts every value boundary on that phase (615 of 615), and `project()` still agrees
+  with the service's own conversion to a constant offset;
+- every one of the 591 files decodes to exactly its declared pixel count;
+- every layer's values sit inside the range the service declares — EVT 7008-9829 against 7008-9994,
+  EVC 11-399 against 11-399, EVH 11-310 against 11-310;
+- **NoData is 1.08%** of stored pixels, the sliver of the window that is sea or outside CONUS;
+- **300 cell centres per layer agreed with the point service, 300 of 300**, and a separate audit
+  reading the files fresh afterwards agreed on 250 of 250 for all three layers.
+
+#### What a later emission step needs from it
+
+Written down now, because the point of the split is that the decision can be taken cold:
+
+1. **The manifest's `grid` block and three functions.** `project(lat, lon)` →
+   `pixelAt(grid.bbox, grid.w, grid.h, x, y)` → `decodeTile()` is the whole path from a cell's
+   coordinates to its pixels. Nothing else needs to know the geometry.
+2. **A decision about the 1.28 m datum offset.** EPSG:5070 is NAD83 and the app's coordinates are
+   WGS84. It is 4% of a pixel: nothing for a summary over ~2,900 pixels, not nothing for per-pixel
+   tiles registered against imagery.
+3. **NoData is −9999 and must not be averaged.** 1.08% of pixels, concentrated at the coast; a cell
+   part of whose ground is NoData needs a rule, and "a missing type is a penalty, not an estimate"
+   (`HOST_NO_INFO`) is the precedent to follow rather than reinvent.
+4. **A cell spans about 54 × 54 pixels and may straddle up to four tiles.** A lattice cell is
+   1,614 × 1,609 m against a 30 m pixel and a 30.7 km tile, so the emission has to stitch across tile
+   edges. Nothing in the checkpoint does that for it.
+5. **The EVT codes are the same codes `cells.json` already holds**, so `data/evt-names.json` and
+   the host rules in `src/model/vegetation.mjs` apply unchanged — which is what makes a
+   before-and-after against the four-sample figures possible at all.
+6. **Sign-off and sequencing.** It changes what `vegSummary()` and `hostFromSamples()` read, so
+   hard rule 2 applies, and the band reading comes first.
 
 #### The fork, captured and deliberately not resolved
 

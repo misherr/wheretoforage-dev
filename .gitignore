@@ -7,3 +7,5 @@ data/*.checkpoint.json
 data/access.json.tmp
 data/*.ckpt.json
 bake.log
+data/*.checkpoint/
+habitat.log
